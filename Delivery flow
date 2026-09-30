@@ -1,0 +1,292 @@
+[
+    {
+        "id": "tab_final",
+        "type": "tab",
+        "label": "Delivery Tracking - PACKAGE_102",
+        "disabled": false,
+        "info": "Smart Secure Delivery Tracking System - Production Flow"
+    },
+
+    {
+        "id": "broker_final",
+        "type": "mqtt-broker",
+        "name": "HiveMQ Cloud",
+        "broker": "PUT_YOUR_MQTT_BROKER_HOST_HERE",
+        "port": "8883",
+        "clientid": "nodered_PACKAGE_102",
+        "autoConnect": true,
+        "usetls": true,
+        "protocolVersion": "4",
+        "keepalive": "60",
+        "cleansession": true,
+        "birthTopic": "", "birthQos": "0", "birthPayload": "",
+        "closeTopic": "", "closePayload": "",
+        "willTopic": "", "willQos": "0", "willPayload": "",
+        "credentials": { "user": "PUT_YOUR_MQTT_USERNAME_HERE", "password": "PUT_YOUR_MQTT_PASSWORD_HERE" }
+    },
+    {
+        "id": "tg_bot_final",
+        "type": "telegram bot",
+        "botname": "delivery_bot",
+        "usernames": "",
+        "chatids": "PUT_YOUR_TELEGRAM_CHAT_ID_HERE",
+        "pollinterval": "300",
+        "baseapiurl": "https://api.telegram.org",
+        "updatemode": "polling",
+        "credentials": { "token": "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE" }
+    },
+
+    {
+        "id": "inject_init_final",
+        "type": "inject",
+        "z": "tab_final",
+        "name": "Init on Deploy",
+        "props": [{ "p": "payload" }],
+        "once": true, "onceDelay": 0.2,
+        "topic": "", "payload": "", "payloadType": "date",
+        "repeat": "", "crontab": "",
+        "x": 140, "y": 40,
+        "wires": [["fn_init_final"]]
+    },
+    {
+        "id": "fn_init_final",
+        "type": "function",
+        "z": "tab_final",
+        "name": "Initialize State",
+        "func": "flow.set('delivery', {\n    packageId: \"PACKAGE_102\",\n    status: \"REGISTERED\",\n    driverName: \"Ahmed\",\n    vehicle: \"V01\",\n    destinationLabel: \"Customer A\",\n    destination: { lat: 31.2229313, lon: 30.5102348 },\n    geofenceRadius: 15,\n    lockState: \"LOCKED\",\n    unauthorizedAttempts: 0,\n    irPresent: null,\n    currentLocation: null,\n    locationHistory: [],\n    distanceToDestination: null,\n    routeDeviationAlerted: false,\n    piOnline: false\n});\nnode.status({ fill: \"grey\", shape: \"ring\", text: \"Initialized\" });\nreturn null;",
+        "outputs": 1,
+        "noerr": 0, "initialize": "", "finalize": "", "libs": [],
+        "x": 340, "y": 40,
+        "wires": [[]]
+    },
+
+    {
+        "id": "mqttin_status_final",
+        "type": "mqtt in",
+        "z": "tab_final",
+        "name": "Status (from Pi)",
+        "topic": "delivery/PACKAGE_102/status",
+        "qos": "1", "datatype": "json",
+        "broker": "broker_final",
+        "x": 160, "y": 120,
+        "wires": [["fn_statushandler_final"]]
+    },
+    {
+        "id": "fn_statushandler_final",
+        "type": "function",
+        "z": "tab_final",
+        "name": "Update Dashboard State",
+        "func": "var delivery = flow.get('delivery') || {};\nvar s = msg.payload;\ndelivery.status = s.status;\ndelivery.lockState = s.lockState;\ndelivery.driverName = s.driverName;\ndelivery.irPresent = s.packagePresent;\ndelivery.unauthorizedAttempts = s.unauthorizedAttempts;\ndelivery.piOnline = true;\nflow.set('delivery', delivery);\nreturn { payload: delivery };",
+        "outputs": 1,
+        "noerr": 0, "initialize": "", "finalize": "", "libs": [],
+        "x": 400, "y": 120,
+        "wires": [["ui_dashboard_final"]]
+    },
+
+    {
+        "id": "mqttin_event_final",
+        "type": "mqtt in",
+        "z": "tab_final",
+        "name": "Event (from Pi)",
+        "topic": "delivery/PACKAGE_102/event",
+        "qos": "1", "datatype": "json",
+        "broker": "broker_final",
+        "x": 160, "y": 180,
+        "wires": [["fn_eventhandler_final"]]
+    },
+    {
+        "id": "fn_eventhandler_final",
+        "type": "function",
+        "z": "tab_final",
+        "name": "Route Event -> Telegram/Email",
+        "func": "var delivery = flow.get('delivery') || {};\nvar ev = msg.payload;\n\nvar icons = {\n    DRIVER_ACCESS: \"\\ud83d\\udd13\",\n    PACKAGE_LOADED: \"\\ud83d\\udce6\",\n    LOCKED_IN_TRANSIT: \"\\ud83d\\udd12\",\n    OPENED_WITHOUT_LOADING: \"\\u26a0\\ufe0f\",\n    UNAUTHORIZED_ACCESS: \"\\ud83d\\udea8\",\n    PACKAGE_MISSING: \"\\ud83d\\udea8\"\n};\nvar icon = icons[ev.type] || \"\\u2139\\ufe0f\";\n\nvar outTelegram = {\n    payload: {\n        chatId: \"PUT_YOUR_TELEGRAM_CHAT_ID_HERE\",\n        type: \"message\",\n        content: icon + \" \" + ev.type + \"\\n\" + ev.message\n    }\n};\n\nvar outEmail = null;\n\nif (ev.type === \"OPENED_WITHOUT_LOADING\") {\n    outEmail = { topic: \"CRITICAL: Compartment Opened Without Loading - PACKAGE_102\", payload: ev.message };\n}\nelse if (ev.type === \"PACKAGE_MISSING\") {\n    outEmail = { topic: \"CRITICAL: Package Missing - PACKAGE_102\", payload: ev.message };\n}\nelse if (ev.type === \"UNAUTHORIZED_ACCESS\") {\n    if ((delivery.unauthorizedAttempts || 0) >= 3) {\n        outEmail = {\n            topic: \"CRITICAL: Repeated Unauthorized Access - PACKAGE_102\",\n            payload: ev.message\n        };\n    }\n}\n\nreturn [outTelegram, outEmail];",
+        "outputs": 2,
+        "noerr": 0, "initialize": "", "finalize": "", "libs": [],
+        "x": 430, "y": 180,
+        "wires": [["tg_sender_final"], ["email_alert_final"]]
+    },
+
+    {
+        "id": "mqttin_location_final",
+        "type": "mqtt in",
+        "z": "tab_final",
+        "name": "OwnTracks Location",
+        "topic": "owntracks/PUT_YOUR_USERNAME_HERE/PUT_YOUR_DEVICE_ID_HERE",
+        "qos": "1", "datatype": "json",
+        "broker": "broker_final",
+        "x": 160, "y": 260,
+        "wires": [["fn_geofence_final", "fn_worldmapformat_final"]]
+    },
+    {
+        "id": "fn_geofence_final",
+        "type": "function",
+        "z": "tab_final",
+        "name": "Geofence Check",
+        "func": "var delivery = flow.get('delivery');\nif (!delivery) return null;\n\nvar lat = msg.payload.lat;\nvar lon = msg.payload.lon;\nvar acc = msg.payload.acc;\nif (lat === undefined || lon === undefined) return null;\n\n// تجاهل أي قراءة GPS دقتها ضعيفة (أكتر من 30 متر)\nif (acc !== undefined && acc > 30) {\n    node.warn(\"Ignored low-accuracy GPS reading: \" + acc + \"m\");\n    return null;\n}\n\ndelivery.currentLocation = { lat: lat, lon: lon };\ndelivery.locationHistory = delivery.locationHistory || [];\ndelivery.locationHistory.push({ lat: lat, lon: lon, t: Date.now() });\nif (delivery.locationHistory.length > 100) delivery.locationHistory.shift();\n\nfunction distanceMeters(lat1, lon1, lat2, lon2) {\n    var R = 6371000;\n    function toRad(d) { return d * Math.PI / 180; }\n    var dLat = toRad(lat2 - lat1);\n    var dLon = toRad(lon2 - lon1);\n    var a = Math.sin(dLat/2)*Math.sin(dLat/2) + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)*Math.sin(dLon/2);\n    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));\n}\n\nvar dest = delivery.destination;\nvar dist = distanceMeters(lat, lon, dest.lat, dest.lon);\ndelivery.distanceToDestination = Math.round(dist);\n\nvar outTelegram = null;\nvar outEmail = null;\n\nif (dist <= delivery.geofenceRadius) {\n    if (delivery.status === \"IN_TRANSIT\") {\n        delivery.status = \"ARRIVED\";\n        outTelegram = {\n            payload: {\n                chatId: \"PUT_YOUR_TELEGRAM_CHAT_ID_HERE\",\n                type: \"message\",\n                content: \"\\ud83d\\udce6 PACKAGE_102 has ARRIVED at destination!\\nDistance: \" + Math.round(dist) + \"m\"\n            }\n        };\n    }\n} else if (delivery.status === \"IN_TRANSIT\" && dist > (delivery.geofenceRadius * 20) && !delivery.routeDeviationAlerted) {\n    delivery.routeDeviationAlerted = true;\n    outTelegram = {\n        payload: {\n            chatId: \"PUT_YOUR_TELEGRAM_CHAT_ID_HERE\",\n            type: \"message\",\n            content: \"\\u26a0\\ufe0f ROUTE DEVIATION detected.\\nDistance: \" + Math.round(dist) + \"m\"\n        }\n    };\n    outEmail = { topic: \"CRITICAL: Serious Route Deviation - PACKAGE_102\", payload: \"Deviation distance: \" + Math.round(dist) + \"m\" };\n}\n\nflow.set('delivery', delivery);\nreturn [outTelegram, outEmail, { payload: delivery }];",
+        "outputs": 3,
+        "noerr": 0, "initialize": "", "finalize": "", "libs": [],
+        "x": 420, "y": 300,
+        "wires": [["tg_sender_final"], ["email_alert_final"], ["ui_dashboard_final"]]
+    },
+    {
+        "id": "fn_worldmapformat_final",
+        "type": "function",
+        "z": "tab_final",
+        "name": "Format for Worldmap",
+        "func": "var delivery = flow.get('delivery');\nif (!delivery) return null;\n\nvar lat = msg.payload.lat;\nvar lon = msg.payload.lon;\nif (lat === undefined || lon === undefined) return null;\n\nvar routeLine = (delivery.locationHistory || []).map(function (p) {\n    return [p.lat, p.lon];\n});\n\nvar currentPoint = { name: \"PACKAGE_102\", lat: lat, lon: lon, icon: \"truck\", layer: \"Shipment\" };\nvar route = { name: \"Shipment Route\", line: routeLine, layer: \"Route\" };\nvar destinationMarker = { name: \"Destination\", lat: delivery.destination.lat, lon: delivery.destination.lon, icon: \"flag\", layer: \"Destination\" };\n\nmsg.payload = [currentPoint, route, destinationMarker];\nreturn msg;",
+        "outputs": 1,
+        "noerr": 0, "initialize": "", "finalize": "", "libs": [],
+        "x": 420, "y": 260,
+        "wires": [["worldmap_final"]]
+    },
+    {
+        "id": "worldmap_final",
+        "type": "worldmap",
+        "z": "tab_final",
+        "name": "Worldmap",
+        "lat": "", "lon": "", "zoom": "", "layer": "OSMG",
+        "cluster": "", "maxage": "", "usermenu": "show", "layers": "show",
+        "panit": "false", "panlock": "false", "zoomlock": "false",
+        "hiderightclick": "false", "coordinates": "", "showgrid": "false",
+        "path": "/worldmap",
+        "x": 640, "y": 260,
+        "wires": [[]]
+    },
+
+    {
+        "id": "inj_calibrate_final",
+        "type": "inject",
+        "z": "tab_final",
+        "name": "📍 Set Destination Here (Calibration)",
+        "props": [{ "p": "payload" }],
+        "once": false, "onceDelay": 0.1,
+        "topic": "", "payload": "", "payloadType": "date",
+        "repeat": "", "crontab": "",
+        "x": 210, "y": 340,
+        "wires": [["fn_calibrate_final"]]
+    },
+    {
+        "id": "fn_calibrate_final",
+        "type": "function",
+        "z": "tab_final",
+        "name": "Calibrate Destination = Current Location",
+        "func": "var delivery = flow.get('delivery');\nif (!delivery || !delivery.currentLocation) {\n    node.warn(\"No current location yet - send a location from OwnTracks first\");\n    return null;\n}\n\ndelivery.destination = {\n    lat: delivery.currentLocation.lat,\n    lon: delivery.currentLocation.lon\n};\nflow.set('delivery', delivery);\n\nnode.status({ fill: \"green\", shape: \"dot\", text: \"Destination set\" });\nreturn { payload: delivery };",
+        "outputs": 1,
+        "noerr": 0, "initialize": "", "finalize": "", "libs": [],
+        "x": 470, "y": 340,
+        "wires": [["ui_dashboard_final"]]
+    },
+
+    {
+        "id": "manual_unlock_final",
+        "type": "ui_button",
+        "z": "tab_final",
+        "name": "Manual Unlock",
+        "group": "grp_dash_final",
+        "order": 2, "width": 0, "height": 0, "passthru": false,
+        "label": "🔓 Unlock",
+        "tooltip": "", "color": "", "bgcolor": "", "icon": "",
+        "payload": "UNLOCK", "payloadType": "str", "topic": "", "topicType": "str",
+        "x": 800, "y": 420,
+        "wires": [["mqttout_cmd_final"]]
+    },
+    {
+        "id": "manual_lock_final",
+        "type": "ui_button",
+        "z": "tab_final",
+        "name": "Manual Lock",
+        "group": "grp_dash_final",
+        "order": 3, "width": 0, "height": 0, "passthru": false,
+        "label": "🔒 Lock",
+        "tooltip": "", "color": "", "bgcolor": "", "icon": "",
+        "payload": "LOCK", "payloadType": "str", "topic": "", "topicType": "str",
+        "x": 800, "y": 460,
+        "wires": [["mqttout_cmd_final"]]
+    },
+    {
+        "id": "mqttout_cmd_final",
+        "type": "mqtt out",
+        "z": "tab_final",
+        "name": "Send Command (Manual Override)",
+        "topic": "delivery/PACKAGE_102/command",
+        "qos": "1", "retain": "false",
+        "broker": "broker_final",
+        "x": 1050, "y": 440,
+        "wires": []
+    },
+
+    {
+        "id": "tg_receiver_final",
+        "type": "telegram receiver",
+        "z": "tab_final",
+        "name": "Telegram Commands",
+        "bot": "tg_bot_final",
+        "x": 160, "y": 420,
+        "wires": [["fn_telegramcmd_final"]]
+    },
+    {
+        "id": "fn_telegramcmd_final",
+        "type": "function",
+        "z": "tab_final",
+        "name": "Handle /status /location",
+        "func": "var delivery = flow.get('delivery') || {};\nvar incomingChatId = msg.payload && msg.payload.chatId;\nvar text = ((msg.payload && msg.payload.content) || \"\").toString().trim().toLowerCase();\n\nif (text === \"/status\") {\n    msg.payload = {\n        chatId: incomingChatId || \"PUT_YOUR_TELEGRAM_CHAT_ID_HERE\",\n        type: \"message\",\n        content: \"\\ud83d\\udce6 PACKAGE_102\\nStatus: \" + (delivery.status || \"UNKNOWN\") +\n                  \"\\nDriver: \" + (delivery.driverName || \"N/A\") +\n                  \"\\nLock: \" + (delivery.lockState || \"UNKNOWN\") +\n                  \"\\nPackage Present: \" + (delivery.irPresent ? \"YES\" : \"NO\") +\n                  \"\\nUnauthorized Attempts: \" + (delivery.unauthorizedAttempts || 0)\n    };\n    return msg;\n}\nif (text === \"/location\") {\n    var locText;\n    if (delivery.currentLocation) {\n        locText = \"\\ud83d\\udccd Current Location:\\nLat: \" + delivery.currentLocation.lat +\n                  \"\\nLon: \" + delivery.currentLocation.lon;\n    } else {\n        locText = \"Location not available yet.\";\n    }\n    msg.payload = { chatId: incomingChatId || \"PUT_YOUR_TELEGRAM_CHAT_ID_HERE\", type: \"message\", content: locText };\n    return msg;\n}\nreturn null;",
+        "outputs": 1,
+        "noerr": 0, "initialize": "", "finalize": "", "libs": [],
+        "x": 420, "y": 420,
+        "wires": [["tg_sender_final"]]
+    },
+    {
+        "id": "tg_sender_final",
+        "type": "telegram sender",
+        "z": "tab_final",
+        "name": "Telegram Sender",
+        "bot": "tg_bot_final",
+        "x": 820, "y": 180,
+        "wires": [[]]
+    },
+
+    {
+        "id": "email_alert_final",
+        "type": "e-mail",
+        "z": "tab_final",
+        "server": "smtp.gmail.com",
+        "port": "465", "secure": true, "tls": true,
+        "name": "PUT_YOUR_GMAIL_ADDRESS_HERE@gmail.com",
+        "dname": "Critical Email Alert",
+        "x": 820, "y": 220,
+        "wires": [],
+        "credentials": {
+            "userid": "PUT_YOUR_GMAIL_ADDRESS_HERE@gmail.com",
+            "password": "PUT_YOUR_APP_PASSWORD_HERE"
+        }
+    },
+
+    {
+        "id": "ui_dashboard_final",
+        "type": "ui_template",
+        "z": "tab_final",
+        "group": "grp_dash_final",
+        "name": "Delivery Dashboard",
+        "order": 1, "width": 0, "height": 0,
+        "format": "html",
+        "storeOutMessages": true, "fwdInMessages": true, "resendOnRefresh": true,
+        "templateScope": "local", "className": "",
+        "template": "<div style=\"font-family:sans-serif; line-height:1.7; font-size:14px;\">\n  <h3>\ud83d\udce6 PACKAGE_102</h3>\n  <p><b>Status:</b> {{msg.payload.status}}</p>\n  <p><b>Driver:</b> {{msg.payload.driverName}}</p>\n  <p><b>Lock:</b> {{msg.payload.lockState}}</p>\n  <p><b>Package Present:</b> {{msg.payload.irPresent ? 'YES' : (msg.payload.irPresent === false ? 'NO' : 'N/A')}}</p>\n  <p><b>Current Location:</b> {{msg.payload.currentLocation ? (msg.payload.currentLocation.lat + ', ' + msg.payload.currentLocation.lon) : 'N/A'}}</p>\n  <p><b>Distance to Destination:</b> {{msg.payload.distanceToDestination != null ? msg.payload.distanceToDestination + ' m' : 'N/A'}}</p>\n  <p><b>Unauthorized Attempts:</b> {{msg.payload.unauthorizedAttempts || 0}}</p>\n</div>",
+        "x": 820, "y": 340,
+        "wires": [[]]
+    },
+    {
+        "id": "grp_dash_final",
+        "type": "ui_group",
+        "name": "Delivery Tracking",
+        "tab": "ui_tab_final",
+        "order": 1, "disp": true, "width": "6", "collapse": false
+    },
+    {
+        "id": "ui_tab_final",
+        "type": "ui_tab",
+        "name": "Delivery",
+        "icon": "dashboard",
+        "order": 1, "disabled": false, "hidden": false
+    }
+]
