@@ -1,0 +1,474 @@
+"""
+========================================================================
+Smart Secure Delivery Tracking System - Raspberry Pi Code (v3)
+========================================================================
+
+السيناريو الجديد:
+    1. Scan Driver  -> السيرفو يفتح فوراً + بيستنى 10 ثواني للـ Package
+    2. Scan Package (خلال الـ 10 ثواني) -> LOADED -> بعد 5 ثواني يقفل
+       تلقائي -> IN_TRANSIT
+    3. لو الـ 10 ثواني خلصت من غير Package -> يقفل نفسه تلقائي (أمان)
+       + إيميل فوري (من غير ما يستنى تكرار)
+    4. أي كارت غير معروف -> إنذار فوري (تليجرام)، إيميل بعد 3 محاولات
+    5. IR بيتابع وجود الشحنة أثناء IN_TRANSIT فقط (لفقدان الشحنة)
+========================================================================
+"""
+
+import time
+import json
+import threading
+
+import board
+import busio
+from adafruit_pn532.i2c import PN532_I2C
+
+from gpiozero import DigitalInputDevice, LED as GPIO_LED
+try:
+    from gpiozero.pins.pigpio import PiGPIOFactory
+    from gpiozero import AngularServo
+    _servo_factory = PiGPIOFactory()
+except Exception:
+    from gpiozero import AngularServo
+    _servo_factory = None
+
+import paho.mqtt.client as mqtt
+
+
+# ========================================================================
+# CONFIGURATION
+# ========================================================================
+
+PACKAGE_ID = "PACKAGE_102"
+
+PACKAGE_UID = "7378BD02"
+DRIVER_UID = "B359B834"
+DRIVER_NAME = "Ahmed"
+
+# ---- GPIO Pins ----
+IR_PIN = 17
+SERVO_PIN = 18
+LED_PIN = 23
+IR_ACTIVE_LOW = True
+
+# ---- Servo angles ----
+SERVO_LOCKED_ANGLE = 0
+SERVO_UNLOCKED_ANGLE = 90
+
+# مدة الانتظار للـ Package بعد ما الدرايفر يفتح (بالثواني)
+LOADING_TIMEOUT_SECONDS = 10
+
+# مدة الانتظار قبل القفل التلقائي بعد ما يتحمل الـ Package (بالثواني)
+AUTO_LOCK_AFTER_SECONDS = 5
+
+# ---- MQTT (HiveMQ Cloud) ----
+MQTT_HOST = "PUT_YOUR_MQTT_BROKER_HOST_HERE"
+MQTT_PORT = 8883
+MQTT_USERNAME = "PUT_YOUR_MQTT_USERNAME_HERE"
+MQTT_PASSWORD = "PUT_YOUR_MQTT_PASSWORD_HERE"
+MQTT_CLIENT_ID = f"raspberry_pi_{PACKAGE_ID}"
+
+# ---- MQTT Topics ----
+TOPIC_STATUS = f"delivery/{PACKAGE_ID}/status"
+TOPIC_EVENT = f"delivery/{PACKAGE_ID}/event"
+TOPIC_IR_STATUS = f"delivery/{PACKAGE_ID}/ir"
+TOPIC_COMMAND = f"delivery/{PACKAGE_ID}/command"
+
+IR_PUBLISH_INTERVAL = 1.0
+SAME_CARD_COOLDOWN = 3.0
+MISSING_THRESHOLD_SECONDS = 10
+
+
+# ========================================================================
+# HARDWARE SETUP
+# ========================================================================
+
+print("[SETUP] Initializing I2C and PN532...")
+i2c = busio.I2C(board.SCL, board.SDA)
+pn532 = PN532_I2C(i2c, debug=False)
+pn532.SAM_configuration()
+
+print("[SETUP] Initializing IR sensor...")
+ir_sensor = DigitalInputDevice(IR_PIN, pull_up=IR_ACTIVE_LOW)
+
+print("[SETUP] Initializing Servo...")
+if _servo_factory:
+    servo = AngularServo(SERVO_PIN, min_angle=0, max_angle=180,
+                          min_pulse_width=0.0005, max_pulse_width=0.0025,
+                          pin_factory=_servo_factory)
+else:
+    servo = AngularServo(SERVO_PIN, min_angle=0, max_angle=180)
+
+print("[SETUP] Initializing LED...")
+led = GPIO_LED(LED_PIN)
+
+# ---- الحالة المحلية ----
+current_status = "REGISTERED"
+lock_state = "LOCKED"
+package_present = None
+ir_absent_since = None
+missing_alert_sent = False
+unauthorized_attempts = 0
+
+waiting_for_package = False
+loading_timer = None
+auto_lock_timer = None
+
+alert_active = False
+led_blink_thread_stop = threading.Event()
+
+
+# ========================================================================
+# LOW-LEVEL SERVO/LED ACTIONS
+# ========================================================================
+
+def open_servo():
+    global lock_state
+    print("[SERVO] Opening...")
+    servo.angle = SERVO_UNLOCKED_ANGLE
+    time.sleep(0.4)
+    servo.detach()
+    led.on()
+    lock_state = "UNLOCKED"
+
+
+def close_servo():
+    global lock_state
+    print("[SERVO] Closing...")
+    servo.angle = SERVO_LOCKED_ANGLE
+    time.sleep(0.4)
+    servo.detach()
+    led.off()
+    lock_state = "LOCKED"
+
+
+# ========================================================================
+# TIMERS
+# ========================================================================
+
+def cancel_loading_timer():
+    global loading_timer
+    if loading_timer is not None:
+        loading_timer.cancel()
+        loading_timer = None
+
+
+def cancel_auto_lock_timer():
+    global auto_lock_timer
+    if auto_lock_timer is not None:
+        auto_lock_timer.cancel()
+        auto_lock_timer = None
+
+
+def start_loading_timer():
+    global loading_timer
+    cancel_loading_timer()
+    loading_timer = threading.Timer(LOADING_TIMEOUT_SECONDS, on_loading_timeout)
+    loading_timer.start()
+
+
+def start_auto_lock_timer():
+    global auto_lock_timer
+    cancel_auto_lock_timer()
+    auto_lock_timer = threading.Timer(AUTO_LOCK_AFTER_SECONDS, on_auto_lock)
+    auto_lock_timer.start()
+
+
+def on_loading_timeout():
+    """لو الدرايفر فتح ومحطش الـ Package خلال الوقت المحدد"""
+    global current_status, waiting_for_package
+    if not waiting_for_package:
+        return  # الـ Package اتحط فعلاً، الـ timer ده ملوش لازمة
+
+    waiting_for_package = False
+    print("[SECURITY] Opened without loading package - auto locking!")
+    close_servo()
+    current_status = "SECURITY_ALERT"
+    publish_status()
+    publish_event(
+        "OPENED_WITHOUT_LOADING",
+        f"Driver opened the compartment but did not load the package "
+        f"within {LOADING_TIMEOUT_SECONDS} seconds. Auto-locked for security."
+    )
+
+
+def on_auto_lock():
+    """قفل تلقائي بعد ما الـ Package يتحمل بنجاح"""
+    global current_status
+    close_servo()
+    current_status = "IN_TRANSIT"
+    print("[MAIN] Locked automatically. Status -> IN_TRANSIT")
+    publish_status()
+    publish_event(
+        "LOCKED_IN_TRANSIT",
+        "Package loaded and compartment locked. Shipment now in transit."
+    )
+
+
+# ========================================================================
+# LED ALERT (Unauthorized)
+# ========================================================================
+
+def blink_led_loop():
+    while not led_blink_thread_stop.is_set():
+        led.on()
+        time.sleep(0.2)
+        led.off()
+        time.sleep(0.2)
+
+
+def start_alert_blink():
+    global alert_active
+    if alert_active:
+        return
+    alert_active = True
+    led_blink_thread_stop.clear()
+    threading.Thread(target=blink_led_loop, daemon=True).start()
+
+
+def stop_alert_blink():
+    global alert_active
+    if not alert_active:
+        return
+    alert_active = False
+    led_blink_thread_stop.set()
+    led.off()
+
+
+# ========================================================================
+# MQTT PUBLISH HELPERS
+# ========================================================================
+
+def publish_status():
+    payload = json.dumps({
+        "status": current_status,
+        "lockState": lock_state,
+        "driverName": DRIVER_NAME,
+        "packagePresent": package_present,
+        "unauthorizedAttempts": unauthorized_attempts,
+        "timestamp": int(time.time())
+    })
+    try:
+        mqtt_client.publish(TOPIC_STATUS, payload, qos=1, retain=True)
+    except Exception as e:
+        print(f"[MQTT] publish_status error: {e}")
+    print(f"[STATUS] {current_status} | Lock={lock_state} | Present={package_present}")
+
+
+def publish_event(event_type, message):
+    payload = json.dumps({
+        "type": event_type,
+        "message": message,
+        "timestamp": int(time.time())
+    })
+    try:
+        mqtt_client.publish(TOPIC_EVENT, payload, qos=1)
+    except Exception as e:
+        print(f"[MQTT] publish_event error: {e}")
+    print(f"[EVENT] {event_type}: {message}")
+
+
+# ========================================================================
+# MQTT CALLBACKS
+# ========================================================================
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("[MQTT] Connected successfully to HiveMQ Cloud.")
+        client.subscribe(TOPIC_COMMAND, qos=1)
+        publish_status()
+    else:
+        print(f"[MQTT] Connection failed, rc={rc}")
+
+
+def on_disconnect(client, userdata, rc):
+    print(f"[MQTT] Disconnected (rc={rc}). Hardware logic keeps working locally.")
+
+
+def on_message(client, userdata, msg):
+    """Override يدوي اختياري من الداشبورد"""
+    payload = msg.payload.decode("utf-8").strip().upper()
+    print(f"[MQTT] Manual override received: {payload}")
+
+    if payload == "UNLOCK":
+        stop_alert_blink()
+        cancel_loading_timer()
+        cancel_auto_lock_timer()
+        open_servo()
+        publish_status()
+    elif payload == "LOCK":
+        cancel_loading_timer()
+        cancel_auto_lock_timer()
+        close_servo()
+        publish_status()
+    elif payload == "ALERT_OFF":
+        stop_alert_blink()
+
+
+# ========================================================================
+# MQTT CLIENT SETUP
+# ========================================================================
+
+mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True)
+mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+mqtt_client.tls_set()
+mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
+mqtt_client.on_message = on_message
+
+print("[MQTT] Connecting to broker...")
+try:
+    mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    mqtt_client.loop_start()
+except Exception as e:
+    print(f"[MQTT] Could not connect ({e}). Continuing WITHOUT MQTT - "
+          f"hardware logic will still work locally.")
+
+
+# ========================================================================
+# CARD HANDLING (السيناريو الجديد بالكامل)
+# ========================================================================
+
+def handle_card(uid_hex):
+    global current_status, unauthorized_attempts, waiting_for_package
+
+    # ---------------- Driver Card ----------------
+    if uid_hex == DRIVER_UID:
+        unauthorized_attempts = 0
+        stop_alert_blink()
+
+        print(f"[CARD] Authorized driver ({DRIVER_NAME}) -> opening, waiting for package")
+        open_servo()
+        current_status = "UNLOCKED_WAITING_FOR_PACKAGE"
+        waiting_for_package = True
+
+        publish_status()
+        publish_event(
+            "DRIVER_ACCESS",
+            f"Authorized driver ({DRIVER_NAME}) scanned. Waiting for package "
+            f"to be loaded within {LOADING_TIMEOUT_SECONDS}s."
+        )
+        start_loading_timer()
+
+    # ---------------- Package Card ----------------
+    elif uid_hex == PACKAGE_UID:
+        if waiting_for_package:
+            waiting_for_package = False
+            cancel_loading_timer()
+
+            print("[CARD] Package loaded successfully")
+            current_status = "LOADED"
+            publish_status()
+            publish_event("PACKAGE_LOADED", "Package loaded successfully.")
+
+            start_auto_lock_timer()
+        else:
+            # الـ Package اتحط من غير ما الدرايفر يفتح الأول (حالة نادرة/تسجيل بس)
+            print("[CARD] Package scanned (registration only, door not open)")
+            current_status = "REGISTERED"
+            publish_status()
+
+    # ---------------- Unknown / Unauthorized Card ----------------
+    else:
+        unauthorized_attempts += 1
+        start_alert_blink()
+        current_status = "SECURITY_ALERT"
+
+        print(f"[CARD] UNAUTHORIZED card -> UID: {uid_hex} (attempt #{unauthorized_attempts})")
+        publish_status()
+        publish_event(
+            "UNAUTHORIZED_ACCESS",
+            f"Unauthorized card scanned. UID: {uid_hex}. Attempt #{unauthorized_attempts}"
+        )
+
+
+# ========================================================================
+# NFC + IR READING LOOP (Main Loop)
+# ========================================================================
+
+def read_ir_present():
+    if IR_ACTIVE_LOW:
+        return ir_sensor.value == 0
+    return ir_sensor.value == 1
+
+
+def main_loop():
+    global package_present, ir_absent_since, missing_alert_sent, current_status
+
+    last_uid = None
+    last_uid_time = 0
+    last_ir_publish_time = 0
+    last_ir_value = None
+
+    print("[MAIN] System ready. Waiting for NFC cards and monitoring IR...")
+
+    while True:
+        now = time.time()
+
+        # ---------- 1) قراءة NFC ----------
+        try:
+            uid_bytes = pn532.read_passive_target(timeout=0.3)
+        except Exception as e:
+            uid_bytes = None
+            print(f"[NFC] Read error: {e}")
+
+        if uid_bytes is not None:
+            uid_hex = "".join("{:02X}".format(b) for b in uid_bytes)
+            if uid_hex != last_uid or (now - last_uid_time) > SAME_CARD_COOLDOWN:
+                handle_card(uid_hex)
+                last_uid = uid_hex
+                last_uid_time = now
+
+        # ---------- 2) قراءة IR (بس لمتابعة فقدان الشحنة أثناء IN_TRANSIT) ----------
+        if (now - last_ir_publish_time) >= IR_PUBLISH_INTERVAL:
+            present = read_ir_present()
+            package_present = present
+            state_str = "PRESENT" if present else "ABSENT"
+
+            if state_str != last_ir_value:
+                print(f"[IR] Package presence changed -> {state_str}")
+                mqtt_client.publish(TOPIC_IR_STATUS, state_str, qos=1, retain=True)
+
+            if current_status == "IN_TRANSIT":
+                if not present:
+                    if ir_absent_since is None:
+                        ir_absent_since = now
+                    elif (now - ir_absent_since) >= MISSING_THRESHOLD_SECONDS and not missing_alert_sent:
+                        current_status = "SECURITY_ALERT"
+                        missing_alert_sent = True
+                        start_alert_blink()
+                        publish_status()
+                        publish_event(
+                            "PACKAGE_MISSING",
+                            f"Package missing during transit for over {MISSING_THRESHOLD_SECONDS} seconds."
+                        )
+                else:
+                    ir_absent_since = None
+                    missing_alert_sent = False
+
+            last_ir_value = state_str
+            last_ir_publish_time = now
+
+        time.sleep(0.2)
+
+
+# ========================================================================
+# START
+# ========================================================================
+
+if __name__ == "__main__":
+    close_servo()
+
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("\n[MAIN] Stopping...")
+    finally:
+        cancel_loading_timer()
+        cancel_auto_lock_timer()
+        stop_alert_blink()
+        try:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        except Exception:
+            pass
+        print("[MAIN] Cleaned up. Bye!")
