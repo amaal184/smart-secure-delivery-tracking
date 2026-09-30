@@ -1,1 +1,0 @@
-# smart-secure-delivery-tracking
